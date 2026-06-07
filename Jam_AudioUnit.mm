@@ -99,6 +99,8 @@
     if (_engine.init_assets(resourcesPath.c_str())) {
         _modelLoaded = YES;
         _engine.load_musiccoca_model(resourcesPath.c_str(), "musiccoca");
+    } else {
+        NSLog(@"Jam_AU: Failed to load static assets externally from: %s", resourcesPath.c_str());
     }
 
     auto makeParam = ^(NSString* ident, NSString* name, AUParameterAddress addr, float min, float max, float def) {
@@ -295,17 +297,6 @@
     _outputBusArray = [[AUAudioUnitBusArray alloc] initWithAudioUnit:self
                                                               busType:AUAudioUnitBusTypeOutput
                                                                busses:@[_outputBus]];
-
-    // Load tokenizer and models externally from custom path or ~/Documents/Magenta/resources/ to keep bundle size tiny
-    NSString *customResources = [[NSUserDefaults standardUserDefaults] stringForKey:@"MagentaRT_CustomResourcesPath"];
-    std::string resourcesPath = customResources ? std::string(customResources.UTF8String) : magentart::paths::get_resources_dir();
-    _modelLoaded = _engine.init_assets(resourcesPath.c_str());
-    if (_modelLoaded) {
-      self.musicCocaModelName = @"musiccoca";
-      _engine.load_musiccoca_model(resourcesPath.c_str(), "musiccoca");
-    } else {
-        NSLog(@"Jam_AU: Failed to load static assets externally from: %s", resourcesPath.c_str());
-    }
 
     self.maximumFramesToRender = 4096;
 
