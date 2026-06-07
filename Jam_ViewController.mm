@@ -31,6 +31,93 @@
 using magentart::core::RealtimeRunner;
 using magentart::core::EngineMetrics;
 
+// ─── Models folder helpers (aligned with mrt2-au3 AU sandbox patterns) ───────
+
+static NSData* JamModelsFolderBookmark(void) {
+    NSData* bookmark = [[NSUserDefaults standardUserDefaults] objectForKey:@"DownloadFolderBookmark"];
+    if (!bookmark) {
+        bookmark = [[NSUserDefaults standardUserDefaults] objectForKey:@"MagentaRT_ModelFolderBookmark"];
+    }
+    return bookmark;
+}
+
+static void JamSaveModelsFolderBookmark(NSString* path, NSData* bookmarkData) {
+    if (!path || !bookmarkData) return;
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setObject:bookmarkData forKey:@"DownloadFolderBookmark"];
+    [defaults setObject:path forKey:@"DownloadFolderPath"];
+    [defaults setObject:bookmarkData forKey:@"MagentaRT_ModelFolderBookmark"];
+    [defaults setObject:path forKey:@"MagentaRT_ModelFolderPath"];
+}
+
+/// If `baseURL` has no models directly, try a `models/` child (e.g. user picked magenta-rt-v2 root).
+static NSURL* JamEffectiveModelsDirectoryURL(NSURL* baseURL) {
+    if (!baseURL) return nil;
+
+    NSArray<NSString*>* direct = [MagentaModelManager listLocalModelsInDirectory:baseURL];
+    if (direct.count > 0) return baseURL;
+
+    NSURL* modelsSub = [baseURL URLByAppendingPathComponent:@"models" isDirectory:YES];
+    BOOL isDir = NO;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:modelsSub.path isDirectory:&isDir] && isDir) {
+        NSArray<NSString*>* nested = [MagentaModelManager listLocalModelsInDirectory:modelsSub];
+        if (nested.count > 0) {
+            NSLog(@"Jam_AU: using models/ subdirectory under %@", baseURL.path);
+            return modelsSub;
+        }
+    }
+    return baseURL;
+}
+
+/// Resolve bookmarked (or default) models directory. Optionally returns scoped base URL for stopAccessing.
+static NSURL* JamResolveModelsDirectory(BOOL* outAccessGranted, NSURL** outScopedBaseURL) {
+    if (outAccessGranted) *outAccessGranted = NO;
+    if (outScopedBaseURL) *outScopedBaseURL = nil;
+
+    NSURL* baseURL = nil;
+    NSData* bookmark = JamModelsFolderBookmark();
+    if (bookmark) {
+        BOOL stale = NO;
+        NSError* error = nil;
+        baseURL = [NSURL URLByResolvingBookmarkData:bookmark
+                                            options:NSURLBookmarkResolutionWithSecurityScope | NSURLBookmarkResolutionWithoutUI
+                                      relativeToURL:nil
+                                bookmarkDataIsStale:&stale
+                                              error:&error];
+        if (error) {
+            NSLog(@"Jam_AU: bookmark resolve failed: %@", error.localizedDescription);
+        } else if (stale) {
+            NSLog(@"Jam_AU: bookmark is stale for %@", baseURL.path);
+        }
+        if (baseURL) {
+            BOOL accessGranted = [baseURL startAccessingSecurityScopedResource];
+            if (outAccessGranted) *outAccessGranted = accessGranted;
+            if (outScopedBaseURL) *outScopedBaseURL = baseURL;
+            if (!accessGranted) {
+                NSLog(@"Jam_AU: startAccessingSecurityScopedResource failed for %@", baseURL.path);
+            }
+        }
+    }
+
+    if (!baseURL) {
+        std::string defaultPath = magentart::paths::get_models_dir();
+        baseURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:defaultPath.c_str()]];
+    }
+
+    return JamEffectiveModelsDirectoryURL(baseURL);
+}
+
+static NSString* JamSandboxAwareResourcesPath(NSString* selectedPath) {
+    NSString* customResourcesPath = [selectedPath stringByAppendingPathComponent:@"resources"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:customResourcesPath]) {
+        return customResourcesPath;
+    }
+    NSString* home = NSHomeDirectory();
+    NSRange range = [home rangeOfString:@"/Library/Containers/"];
+    NSString* realHome = (range.location != NSNotFound) ? [home substringToIndex:range.location] : home;
+    return [realHome stringByAppendingPathComponent:@"Documents/Magenta/magenta-rt-v2/resources"];
+}
+
 // ─── Dev server probe ────────────────────────────────────────────────────────
 
 static const int kJamDevServerPort = 62421;
@@ -370,11 +457,14 @@ static BOOL isDevServerRunning(void) {
         state[@"savedUserPresets"] = presets;
     }
 
-    NSString* searchPath = [[NSUserDefaults standardUserDefaults] stringForKey:@"MagentaRT_ModelFolderPath"];
-    if (!searchPath) {
-        searchPath = [NSString stringWithUTF8String:magentart::paths::get_models_dir().c_str()];
+    NSString* savedPath = [[NSUserDefaults standardUserDefaults] stringForKey:@"DownloadFolderPath"];
+    if (!savedPath) {
+        savedPath = [[NSUserDefaults standardUserDefaults] stringForKey:@"MagentaRT_ModelFolderPath"];
     }
-    state[@"downloadPath"] = searchPath;
+    if (!savedPath) {
+        savedPath = [NSString stringWithUTF8String:magentart::paths::get_models_dir().c_str()];
+    }
+    state[@"downloadPath"] = savedPath;
     state[@"hostMode"] = @"auv3";
     state[@"computerKeyboardMidi"] = @YES;
 
@@ -831,70 +921,61 @@ static BOOL isDevServerRunning(void) {
 - (void)handleSelectDownloadFolder {
     [MagentaModelManager selectDownloadFolderWithParentWindow:self.view.window
                                                   completion:^(NSString *selectedPath, NSData *bookmarkData, NSError *error) {
-        if (selectedPath) {
+        if (selectedPath && bookmarkData) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                // Save custom path bookmarks
-                [[NSUserDefaults standardUserDefaults] setObject:bookmarkData forKey:@"MagentaRT_ModelFolderBookmark"];
-                [[NSUserDefaults standardUserDefaults] setObject:selectedPath forKey:@"MagentaRT_ModelFolderPath"];
+                JamSaveModelsFolderBookmark(selectedPath, bookmarkData);
 
-                // Determine if custom resources folder exists inside the selected path
-                NSString *customResourcesPath = [selectedPath stringByAppendingPathComponent:@"resources"];
-                BOOL hasCustomResources = [[NSFileManager defaultManager] fileExistsAtPath:customResourcesPath];
+                NSString *resourcesPathToLoad = JamSandboxAwareResourcesPath(selectedPath);
 
-                NSString *resourcesPathToLoad = hasCustomResources ? customResourcesPath : [NSString stringWithUTF8String:magentart::paths::get_resources_dir().c_str()];
-
-                // Re-initialize the C++ engine with this selected resources folder!
-                if (![self engine]->init_assets(resourcesPathToLoad.UTF8String)) {
-                    NSLog(@"Jam: Failed to initialize C++ assets from custom path: %@", resourcesPathToLoad);
-                } else {
-                    NSLog(@"Jam: Successfully initialized C++ assets from path: %@", resourcesPathToLoad);
-                    // Save custom resources path for subsequent launches!
-                    [[NSUserDefaults standardUserDefaults] setObject:resourcesPathToLoad forKey:@"MagentaRT_CustomResourcesPath"];
+                RealtimeRunner* engine = [self engine];
+                if (engine) {
+                    if (!engine->init_assets(resourcesPathToLoad.UTF8String)) {
+                        NSLog(@"Jam_AU: Failed to initialize assets from path: %@", resourcesPathToLoad);
+                    } else {
+                        NSLog(@"Jam_AU: Successfully initialized assets from path: %@", resourcesPathToLoad);
+                        [[NSUserDefaults standardUserDefaults] setObject:resourcesPathToLoad forKey:@"MagentaRT_CustomResourcesPath"];
+                    }
                 }
-                // Force close the onboarding modal!
+
                 [self sendStateUpdate:@{
                     @"downloadPath": selectedPath,
-                    @"resourcesMissing": @NO // Close onboarding modal instantly!
+                    @"resourcesMissing": @(![MagentaModelDownloader areSharedResourcesValid])
                 }];
 
                 [self handleListLocalModels];
 
-                // Programmatically auto-load the first available model in the newly selected folder if present!
-                NSArray<NSString *> *modelFiles = [MagentaModelManager listLocalModelsInDirectory:[NSURL fileURLWithPath:selectedPath]];
+                // Auto-load first model using security-scoped bookmark (not raw path).
+                BOOL accessGranted = NO;
+                NSURL* scopedBase = nil;
+                NSURL* modelsDir = JamResolveModelsDirectory(&accessGranted, &scopedBase);
+                NSArray<NSString *> *modelFiles = [MagentaModelManager listLocalModelsInDirectory:modelsDir];
+                if (accessGranted && scopedBase) {
+                    [scopedBase stopAccessingSecurityScopedResource];
+                }
                 if (modelFiles.count > 0) {
                     [self handleSelectModel:modelFiles[0]];
+                } else {
+                    NSLog(@"Jam_AU: no models found under %@ (effective: %@)", selectedPath, modelsDir.path);
                 }
             });
         } else if (error) {
-            NSLog(@"Jam: Failed to create folder bookmark: %@", error.localizedDescription);
+            NSLog(@"Jam_AU: Failed to create folder bookmark: %@", error.localizedDescription);
         }
     }];
 }
 
 - (void)handleListLocalModels {
-    NSData* bookmark = [[NSUserDefaults standardUserDefaults] objectForKey:@"MagentaRT_ModelFolderBookmark"];
-    NSURL* modelsDir = nil;
     BOOL accessGranted = NO;
-
-    if (bookmark) {
-        BOOL stale = NO;
-        modelsDir = [NSURL URLByResolvingBookmarkData:bookmark options:NSURLBookmarkResolutionWithSecurityScope relativeToURL:nil bookmarkDataIsStale:&stale error:nil];
-        if (modelsDir) {
-            accessGranted = [modelsDir startAccessingSecurityScopedResource];
-        }
-    }
-
-    if (!modelsDir) {
-        std::string defaultPath = magentart::paths::get_models_dir();
-        modelsDir = [NSURL fileURLWithPath:[NSString stringWithUTF8String:defaultPath.c_str()]];
-    }
+    NSURL* scopedBase = nil;
+    NSURL* modelsDir = JamResolveModelsDirectory(&accessGranted, &scopedBase);
 
     [[NSFileManager defaultManager] createDirectoryAtURL:modelsDir withIntermediateDirectories:YES attributes:nil error:nil];
 
     NSArray<NSString *> *modelFiles = [MagentaModelManager listLocalModelsInDirectory:modelsDir];
+    NSLog(@"Jam_AU: listLocalModels at %@ -> %lu models", modelsDir.path, (unsigned long)modelFiles.count);
 
-    if (accessGranted) {
-        [modelsDir stopAccessingSecurityScopedResource];
+    if (accessGranted && scopedBase) {
+        [scopedBase stopAccessingSecurityScopedResource];
     }
 
     [self sendStateUpdate:@{@"localModels": modelFiles}];
@@ -904,22 +985,9 @@ static BOOL isDevServerRunning(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (![self engine]) return;
 
-        NSData* bookmark = [[NSUserDefaults standardUserDefaults] objectForKey:@"MagentaRT_ModelFolderBookmark"];
-        NSURL* modelsDir = nil;
         BOOL accessGranted = NO;
-
-        if (bookmark) {
-            BOOL stale = NO;
-            modelsDir = [NSURL URLByResolvingBookmarkData:bookmark options:NSURLBookmarkResolutionWithSecurityScope relativeToURL:nil bookmarkDataIsStale:&stale error:nil];
-            if (modelsDir) {
-                accessGranted = [modelsDir startAccessingSecurityScopedResource];
-            }
-        }
-
-        if (!modelsDir) {
-            std::string defaultPath = magentart::paths::get_models_dir();
-            modelsDir = [NSURL fileURLWithPath:[NSString stringWithUTF8String:defaultPath.c_str()]];
-        }
+        NSURL* scopedBase = nil;
+        NSURL* modelsDir = JamResolveModelsDirectory(&accessGranted, &scopedBase);
 
         NSURL* modelURL = [modelsDir URLByAppendingPathComponent:modelName];
         NSString* path = modelURL.path;
@@ -939,37 +1007,24 @@ static BOOL isDevServerRunning(void) {
 
         if (!mlxfnPath) {
             [self sendStateUpdate:@{@"modelName": @"No .mlxfn found"}];
-            if (accessGranted) [modelsDir stopAccessingSecurityScopedResource];
+            if (accessGranted && scopedBase) [scopedBase stopAccessingSecurityScopedResource];
             return;
         }
 
         [self loadModelAtPath:mlxfnPath];
         [[NSUserDefaults standardUserDefaults] setObject:modelName forKey:@"Jam_LoadedModelName"];
 
-        if (accessGranted) {
-            [modelsDir stopAccessingSecurityScopedResource];
+        if (accessGranted && scopedBase) {
+            [scopedBase stopAccessingSecurityScopedResource];
         }
     });
 }
 
 - (void)handleDeleteModel:(NSString *)modelName {
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSData* bookmark = [[NSUserDefaults standardUserDefaults] objectForKey:@"Jam_ModelSearchBookmark"];
-        NSURL* modelsDir = nil;
         BOOL accessGranted = NO;
-
-        if (bookmark) {
-            BOOL stale = NO;
-            modelsDir = [NSURL URLByResolvingBookmarkData:bookmark options:NSURLBookmarkResolutionWithSecurityScope relativeToURL:nil bookmarkDataIsStale:&stale error:nil];
-            if (modelsDir) {
-                accessGranted = [modelsDir startAccessingSecurityScopedResource];
-            }
-        }
-
-        if (!modelsDir) {
-            std::string defaultPath = magentart::paths::get_models_dir();
-            modelsDir = [NSURL fileURLWithPath:[NSString stringWithUTF8String:defaultPath.c_str()]];
-        }
+        NSURL* scopedBase = nil;
+        NSURL* modelsDir = JamResolveModelsDirectory(&accessGranted, &scopedBase);
 
         NSURL* modelURL = [modelsDir URLByAppendingPathComponent:modelName];
         NSString* path = modelURL.path;
@@ -983,8 +1038,8 @@ static BOOL isDevServerRunning(void) {
             [self handleListLocalModels];
         }
 
-        if (accessGranted) {
-            [modelsDir stopAccessingSecurityScopedResource];
+        if (accessGranted && scopedBase) {
+            [scopedBase stopAccessingSecurityScopedResource];
         }
     });
 }
