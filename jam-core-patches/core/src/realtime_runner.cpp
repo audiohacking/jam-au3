@@ -460,7 +460,7 @@ void RealtimeRunner::inference_loop() {
             while (ring_L_.free_space() < kFrameSamples &&
                    running_.load(std::memory_order_relaxed)) {
                 {
-                    detail::MlxGpuGuard guard;
+                    ::magentart::detail::MlxGpuGuard guard;
                     auto dummy = mx::array({0.0f}) + mx::array({0.0f});
                     mx::eval(dummy);
                 }

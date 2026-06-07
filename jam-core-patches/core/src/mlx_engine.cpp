@@ -2484,7 +2484,7 @@ bool MLXEngine::init_assets(const char *d, const char *s) {
   return impl_->init_assets(d, s);
 }
 bool MLXEngine::load_model(const char *p) {
-  detail::MlxGpuGuard guard;
+  ::magentart::detail::MlxGpuGuard guard;
   return impl_->load_model(p);
 }
 bool MLXEngine::load_prefill_model(const char *ss, const char *pf) {
@@ -2496,7 +2496,7 @@ bool MLXEngine::prefill_state(const float *s, int n, int trim_front_frames,
                               std::vector<float> *out_audio_L,
                               std::vector<float> *out_audio_R,
                               bool mask_musiccoca_during_prefill) {
-  detail::MlxGpuGuard guard;
+  ::magentart::detail::MlxGpuGuard guard;
   return impl_->prefill_state(s, n, trim_front_frames, trim_back_frames,
                               std::move(cb), out_audio_L, out_audio_R,
                               mask_musiccoca_during_prefill);
@@ -2506,7 +2506,7 @@ bool MLXEngine::prefill_state_from_tokens(
     std::function<void(const std::string &)> cb,
     std::vector<float> *out_audio_L, std::vector<float> *out_audio_R,
     bool mask_musiccoca_during_prefill) {
-  detail::MlxGpuGuard guard;
+  ::magentart::detail::MlxGpuGuard guard;
   return impl_->prefill_state_from_tokens(tokens, num_frames, std::move(cb),
                                           out_audio_L, out_audio_R,
                                           mask_musiccoca_during_prefill);
@@ -2515,7 +2515,7 @@ bool MLXEngine::prefill_silence(int duration_frames, bool reset_first,
                                 std::function<void(const std::string &)> cb,
                                 std::vector<float> *out_audio_L,
                                 std::vector<float> *out_audio_R) {
-  detail::MlxGpuGuard guard;
+  ::magentart::detail::MlxGpuGuard guard;
   return impl_->prefill_silence(duration_frames, reset_first, std::move(cb),
                                 out_audio_L, out_audio_R);
 }
@@ -2523,7 +2523,7 @@ void MLXEngine::unload() { impl_->unload(); }
 void MLXEngine::reset_state() { impl_->reset_state(); }
 bool MLXEngine::save_state(const char *p) { return impl_->save_state(p); }
 bool MLXEngine::load_state(const char *p) {
-  detail::MlxGpuGuard guard;
+  ::magentart::detail::MlxGpuGuard guard;
   return impl_->load_state(p);
 }
 void MLXEngine::reset_to_factory() { impl_->reset_to_factory(); }
@@ -2531,7 +2531,7 @@ bool MLXEngine::is_loaded() const { return impl_->transformer_fn_.has_value(); }
 
 // Generation
 bool MLXEngine::generate_frame(float *L, float *R, std::int32_t *tokens_out) {
-  detail::MlxGpuGuard guard;
+  ::magentart::detail::MlxGpuGuard guard;
   return impl_->generate_frame(L, R, tokens_out);
 }
 const FrameMetrics &MLXEngine::last_metrics() const {
