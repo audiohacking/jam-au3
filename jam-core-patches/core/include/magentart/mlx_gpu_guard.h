@@ -20,11 +20,13 @@
 /// AUv3 hosts load multiple plugin instances in one extension process. MLX
 /// v0.31.x is not safe for concurrent `mx::eval` across threads, so all GPU
 /// entry points must hold this lock.
+///
+/// Lives in `magentart::detail` (not `magentart::core::detail`) so it does
+/// not shadow `AutoreleasePool` in realtime_runner.cpp.
 
 #include <mutex>
 
 namespace magentart {
-namespace core {
 namespace detail {
 
 inline std::mutex& mlx_gpu_mutex() {
@@ -40,5 +42,4 @@ struct MlxGpuGuard {
 };
 
 }  // namespace detail
-}  // namespace core
 }  // namespace magentart
