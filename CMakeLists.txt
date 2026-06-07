@@ -38,6 +38,16 @@ if(NOT EXISTS "${MAGENTA_RT_DIR}/core/CMakeLists.txt")
     "  git submodule update --init --recursive")
 endif()
 
+# Overlay jam-au3 core fixes onto the submodule at configure time (bounce safety,
+# process-wide MLX GPU lock). Keeps CI working without a magenta-realtime fork.
+set(JAM_CORE_PATCH_DIR "${CMAKE_SOURCE_DIR}/jam-core-patches")
+if(EXISTS "${JAM_CORE_PATCH_DIR}/core/src/realtime_runner.cpp")
+  file(COPY "${JAM_CORE_PATCH_DIR}/core/"
+       DESTINATION "${MAGENTA_RT_DIR}/core/"
+       FILES_MATCHING PATTERN "*")
+  message(STATUS "Applied jam-core-patches overlay to magenta-realtime/core")
+endif()
+
 set(MAGENTART_VERSION "0.0.1")
 add_definitions(-DMAGENTART_VERSION="${MAGENTART_VERSION}")
 

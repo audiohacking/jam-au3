@@ -17,7 +17,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ${{ github.workspace }}/.ccache
-        key: jam-au3-ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'magenta-realtime/core/**', 'Jam_AudioUnit.mm', 'Jam_ViewController.mm', 'Jam_AUHostApp.mm') }}
+        key: jam-au3-ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'jam-core-patches/**', 'magenta-realtime/core/**', 'Jam_AudioUnit.mm', 'Jam_ViewController.mm', 'Jam_AUHostApp.mm') }}
         restore-keys: |
           jam-au3-ccache-${{ runner.os }}-
 

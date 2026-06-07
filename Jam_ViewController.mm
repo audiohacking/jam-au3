@@ -50,6 +50,14 @@ static void JamSaveModelsFolderBookmark(NSString* path, NSData* bookmarkData) {
     [defaults setObject:path forKey:@"MagentaRT_ModelFolderPath"];
 }
 
+static void JamClearModelsFolderBookmarks(void) {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    [defaults removeObjectForKey:@"DownloadFolderBookmark"];
+    [defaults removeObjectForKey:@"DownloadFolderPath"];
+    [defaults removeObjectForKey:@"MagentaRT_ModelFolderBookmark"];
+    [defaults removeObjectForKey:@"MagentaRT_ModelFolderPath"];
+}
+
 /// If `baseURL` has no models directly, try a `models/` child (e.g. user picked magenta-rt-v2 root).
 static NSURL* JamEffectiveModelsDirectoryURL(NSURL* baseURL) {
     if (!baseURL) return nil;
@@ -104,7 +112,24 @@ static NSURL* JamResolveModelsDirectory(BOOL* outAccessGranted, NSURL** outScope
         baseURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:defaultPath.c_str()]];
     }
 
-    return JamEffectiveModelsDirectoryURL(baseURL);
+    NSURL* effectiveURL = JamEffectiveModelsDirectoryURL(baseURL);
+    if (bookmark && baseURL) {
+        NSArray<NSString*>* listed = [MagentaModelManager listLocalModelsInDirectory:effectiveURL];
+        if (listed.count == 0) {
+            NSLog(@"Jam_AU: bookmarked models folder is empty at %@ — clearing stale bookmark", effectiveURL.path);
+            if (outAccessGranted && *outAccessGranted && outScopedBaseURL && *outScopedBaseURL) {
+                [*outScopedBaseURL stopAccessingSecurityScopedResource];
+                if (outAccessGranted) *outAccessGranted = NO;
+                if (outScopedBaseURL) *outScopedBaseURL = nil;
+            }
+            JamClearModelsFolderBookmarks();
+            std::string defaultPath = magentart::paths::get_models_dir();
+            baseURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:defaultPath.c_str()]];
+            effectiveURL = JamEffectiveModelsDirectoryURL(baseURL);
+        }
+    }
+
+    return effectiveURL;
 }
 
 static NSString* JamSandboxAwareResourcesPath(NSString* selectedPath) {
@@ -171,6 +196,12 @@ static BOOL isDevServerRunning(void) {
 - (void)handleSelectModel:(NSString*)modelName;
 - (void)handleDeleteModel:(NSString*)modelName;
 - (void)handleInitResources:(NSString*)modelName;
+- (BOOL)loadModelAtPath:(NSString*)mlxfnPath;
+- (NSString*)mlxfnPathForModelAtURL:(NSURL*)modelURL;
+- (void)saveLoadedModelBookmarkForURL:(NSURL*)modelURL modelName:(NSString*)modelName;
+- (void)autoLoadSavedModelIfNeeded;
+- (void)tryAutoLoadFromModelsDirectory;
+- (void)promptForModelsFolderIfNeeded;
 @end
 
 @implementation JamViewController {
@@ -183,6 +214,7 @@ static BOOL isDevServerRunning(void) {
     NSString* _modelName;
     NSString* _currentPromptText;
     BOOL _isPlaying;
+    BOOL _promptedForModelsFolder;
 }
 
 // ─── Parameter bridging ──────────────────────────────────────────────────────
@@ -430,6 +462,17 @@ static BOOL isDevServerRunning(void) {
     state[@"params"] = initialParams;
     state[@"isPlaying"] = @(_isPlaying);
     state[@"solomode"] = @([[self jamAU] soloMode] ? [[self jamAU] soloMode]->load(std::memory_order_relaxed) : NO);
+
+    JamAudioUnit* jamAU = [self jamAU];
+    if (jamAU.modelName.length > 0) {
+        _modelName = jamAU.modelName;
+    } else {
+        NSString* savedName = [[NSUserDefaults standardUserDefaults] stringForKey:@"Jam_LoadedModelName"];
+        if (!savedName) {
+            savedName = [[NSUserDefaults standardUserDefaults] stringForKey:@"LoadedModelName"];
+        }
+        if (savedName.length > 0) _modelName = savedName;
+    }
     if (_modelName) state[@"modelName"] = _modelName;
 
     // Restore saved prompt (always send, empty string if nothing saved)
@@ -474,6 +517,7 @@ static BOOL isDevServerRunning(void) {
 
     [self sendStateUpdate:state];
     [self handleListLocalModels];
+    [self autoLoadSavedModelIfNeeded];
 }
 
 - (void)setComputerKeyboardMidiEnabled:(BOOL)enabled {
@@ -751,9 +795,50 @@ static BOOL isDevServerRunning(void) {
 
 // ─── Model loading (shared core) ─────────────────────────────────────────────
 
-- (void)loadModelAtPath:(NSString*)mlxfnPath {
+- (NSString*)mlxfnPathForModelAtURL:(NSURL*)modelURL {
+    if (!modelURL) return nil;
+    NSString* path = modelURL.path;
+    BOOL isDir = NO;
+    [[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDir];
+
+    if ([path hasSuffix:@".mlxfn"]) {
+        return path;
+    }
+    if (isDir) {
+        std::string dirPathStr = path.UTF8String;
+        std::string foundMlxfn = magentart::paths::find_mlxfn_in_dir(dirPathStr);
+        if (!foundMlxfn.empty()) {
+            return [NSString stringWithUTF8String:foundMlxfn.c_str()];
+        }
+    }
+    return nil;
+}
+
+- (void)saveLoadedModelBookmarkForURL:(NSURL*)modelURL modelName:(NSString*)modelName {
+    if (!modelURL || !modelName) return;
+    JamAudioUnit* au = [self jamAU];
+    if (!au) return;
+
+    NSError* bmErr = nil;
+    NSData* modelBookmark = [modelURL bookmarkDataWithOptions:NSURLBookmarkCreationWithSecurityScope
+                               includingResourceValuesForKeys:nil
+                                                relativeToURL:nil
+                                                        error:&bmErr];
+    if (modelBookmark) {
+        au.modelBookmark = modelBookmark;
+        au.modelName = modelName;
+        NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+        [defaults setObject:modelBookmark forKey:@"LoadedModelBookmark"];
+        [defaults setObject:modelName forKey:@"Jam_LoadedModelName"];
+        [defaults setObject:modelName forKey:@"LoadedModelName"];
+    } else if (bmErr) {
+        NSLog(@"Jam_AU: Failed to create model bookmark: %@", bmErr.localizedDescription);
+    }
+}
+
+- (BOOL)loadModelAtPath:(NSString*)mlxfnPath {
     RealtimeRunner* engine = [self engine];
-    if (!engine) return;
+    if (!engine || !mlxfnPath) return NO;
 
     NSLog(@"Jam: Loading model from %@", mlxfnPath);
     BOOL success = engine->load_model(mlxfnPath.UTF8String);
@@ -786,15 +871,121 @@ static BOOL isDevServerRunning(void) {
         engine->set_text_prompts(texts, weights);
         engine->set_blend_weights(weights.data(), (int)weights.size());
 
-        [self sendStateUpdate:@{
-            @"modelName": mlxfnPath.lastPathComponent,
-            @"prompt": promptToUse
-        }];
-
+        [self notifyModelLoaded:mlxfnPath.lastPathComponent];
         [[NSUserDefaults standardUserDefaults] setObject:mlxfnPath forKey:@"Jam_ModelPath"];
     } else {
         [self sendStateUpdate:@{@"modelName": [NSString stringWithFormat:@"Failed: %@", mlxfnPath.lastPathComponent]}];
     }
+    return success;
+}
+
+- (void)autoLoadSavedModelIfNeeded {
+    JamAudioUnit* au = [self jamAU];
+    RealtimeRunner* engine = [self engine];
+    if (!au || !engine || engine->is_loaded()) return;
+
+    if (au.modelBookmark) {
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            BOOL stale = NO;
+            NSError* error = nil;
+            NSURL* url = [NSURL URLByResolvingBookmarkData:au.modelBookmark
+                                                   options:NSURLBookmarkResolutionWithoutUI | NSURLBookmarkResolutionWithSecurityScope
+                                             relativeToURL:nil
+                                       bookmarkDataIsStale:&stale
+                                                     error:&error];
+            if (url && [url startAccessingSecurityScopedResource]) {
+                NSString* mlxfnPath = [self mlxfnPathForModelAtURL:url];
+                if (mlxfnPath && [self loadModelAtPath:mlxfnPath]) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [self saveLoadedModelBookmarkForURL:url modelName:au.modelName ?: mlxfnPath.lastPathComponent];
+                    });
+                }
+                [url stopAccessingSecurityScopedResource];
+                return;
+            }
+            NSLog(@"Jam_AU: Failed to resolve AU model bookmark: %@", error);
+        });
+        return;
+    }
+
+    NSData* savedBookmark = [[NSUserDefaults standardUserDefaults] objectForKey:@"LoadedModelBookmark"];
+    if (savedBookmark) {
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            BOOL stale = NO;
+            NSError* error = nil;
+            NSURL* url = [NSURL URLByResolvingBookmarkData:savedBookmark
+                                                   options:NSURLBookmarkResolutionWithoutUI | NSURLBookmarkResolutionWithSecurityScope
+                                             relativeToURL:nil
+                                       bookmarkDataIsStale:&stale
+                                                     error:&error];
+            if (url && [url startAccessingSecurityScopedResource]) {
+                NSString* mlxfnPath = [self mlxfnPathForModelAtURL:url];
+                if (mlxfnPath && [self loadModelAtPath:mlxfnPath]) {
+                    NSString* savedModelName = [[NSUserDefaults standardUserDefaults] stringForKey:@"Jam_LoadedModelName"];
+                    if (!savedModelName) {
+                        savedModelName = [[NSUserDefaults standardUserDefaults] stringForKey:@"LoadedModelName"];
+                    }
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [self saveLoadedModelBookmarkForURL:url
+                                                  modelName:savedModelName ?: mlxfnPath.lastPathComponent];
+                    });
+                }
+                [url stopAccessingSecurityScopedResource];
+                return;
+            }
+            NSLog(@"Jam_AU: Failed to resolve saved model bookmark: %@", error);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self tryAutoLoadFromModelsDirectory];
+            });
+        });
+        return;
+    }
+
+    [self tryAutoLoadFromModelsDirectory];
+}
+
+- (void)tryAutoLoadFromModelsDirectory {
+    RealtimeRunner* engine = [self engine];
+    if (!engine || engine->is_loaded()) return;
+
+    BOOL accessGranted = NO;
+    NSURL* scopedBase = nil;
+    NSURL* modelsDir = JamResolveModelsDirectory(&accessGranted, &scopedBase);
+    NSArray<NSString*>* modelFiles = [MagentaModelManager listLocalModelsInDirectory:modelsDir];
+    if (modelFiles.count == 0) {
+        if (accessGranted && scopedBase) [scopedBase stopAccessingSecurityScopedResource];
+        [self promptForModelsFolderIfNeeded];
+        return;
+    }
+
+    NSString* preferred = [[NSUserDefaults standardUserDefaults] stringForKey:@"Jam_LoadedModelName"];
+    if (!preferred) {
+        preferred = [[NSUserDefaults standardUserDefaults] stringForKey:@"LoadedModelName"];
+    }
+    if (!preferred || ![modelFiles containsObject:preferred]) {
+        preferred = @"mrt2_small";
+        if (![modelFiles containsObject:preferred]) {
+            preferred = modelFiles[0];
+        }
+    }
+
+    NSURL* modelURL = [modelsDir URLByAppendingPathComponent:preferred];
+    NSString* mlxfnPath = [self mlxfnPathForModelAtURL:modelURL];
+    if (mlxfnPath && [self loadModelAtPath:mlxfnPath]) {
+        [self saveLoadedModelBookmarkForURL:modelURL modelName:preferred];
+    }
+
+    if (accessGranted && scopedBase) {
+        [scopedBase stopAccessingSecurityScopedResource];
+    }
+}
+
+- (void)promptForModelsFolderIfNeeded {
+    if (_promptedForModelsFolder || JamModelsFolderBookmark()) return;
+    _promptedForModelsFolder = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self handleSelectDownloadFolder];
+    });
 }
 
 - (void)handleLoadModel {
@@ -810,28 +1001,19 @@ static BOOL isDevServerRunning(void) {
 
         dispatch_async(dispatch_get_main_queue(), ^{
             NSString* path = url.path;
-            BOOL isDir = NO;
-            [[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDir];
+            BOOL accessed = [url startAccessingSecurityScopedResource];
 
-            NSString* mlxfnPath = nil;
-            if (isDir) {
-                NSArray *contents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:path error:nil];
-                for (NSString *file in contents) {
-                    if ([file hasSuffix:@".mlxfn"]) {
-                        mlxfnPath = [path stringByAppendingPathComponent:file];
-                        break;
-                    }
-                }
-            } else if ([path hasSuffix:@".mlxfn"]) {
-                mlxfnPath = path;
-            }
-
+            NSString* mlxfnPath = [self mlxfnPathForModelAtURL:url];
             if (!mlxfnPath) {
+                if (accessed) [url stopAccessingSecurityScopedResource];
                 [self sendStateUpdate:@{@"modelName": @"No .mlxfn found"}];
                 return;
             }
 
-            [self loadModelAtPath:mlxfnPath];
+            if ([self loadModelAtPath:mlxfnPath]) {
+                [self saveLoadedModelBookmarkForURL:url modelName:mlxfnPath.lastPathComponent];
+            }
+            if (accessed) [url stopAccessingSecurityScopedResource];
         });
     };
 
@@ -992,20 +1174,7 @@ static BOOL isDevServerRunning(void) {
         NSURL* modelsDir = JamResolveModelsDirectory(&accessGranted, &scopedBase);
 
         NSURL* modelURL = [modelsDir URLByAppendingPathComponent:modelName];
-        NSString* path = modelURL.path;
-        BOOL isDir = NO;
-        [[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDir];
-
-        NSString* mlxfnPath = nil;
-        if ([path hasSuffix:@".mlxfn"]) {
-            mlxfnPath = path;
-        } else if (isDir) {
-            std::string dirPathStr = path.UTF8String;
-            std::string foundMlxfn = magentart::paths::find_mlxfn_in_dir(dirPathStr);
-            if (!foundMlxfn.empty()) {
-                mlxfnPath = [NSString stringWithUTF8String:foundMlxfn.c_str()];
-            }
-        }
+        NSString* mlxfnPath = [self mlxfnPathForModelAtURL:modelURL];
 
         if (!mlxfnPath) {
             [self sendStateUpdate:@{@"modelName": @"No .mlxfn found"}];
@@ -1013,8 +1182,9 @@ static BOOL isDevServerRunning(void) {
             return;
         }
 
-        [self loadModelAtPath:mlxfnPath];
-        [[NSUserDefaults standardUserDefaults] setObject:modelName forKey:@"Jam_LoadedModelName"];
+        if ([self loadModelAtPath:mlxfnPath]) {
+            [self saveLoadedModelBookmarkForURL:modelURL modelName:modelName];
+        }
 
         if (accessGranted && scopedBase) {
             [scopedBase stopAccessingSecurityScopedResource];
