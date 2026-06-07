@@ -202,6 +202,12 @@ static BOOL isDevServerRunning(void) {
 - (void)autoLoadSavedModelIfNeeded;
 - (void)tryAutoLoadFromModelsDirectory;
 - (void)promptForModelsFolderIfNeeded;
+- (BOOL)decodeAudioPromptAtURL:(NSURL*)url
+                           index:(int)index
+                        filename:(NSString*)fallbackName;
+- (void)finishAudioPromptLoad:(NSString*)displayName index:(int)index success:(BOOL)success;
+- (void)loadAudioPromptFromURL:(NSURL*)url index:(int)index accessGranted:(BOOL)accessGranted;
+- (void)loadAudioPromptFromData:(NSData*)data filename:(NSString*)filename index:(int)index;
 @end
 
 @implementation JamViewController {
@@ -713,16 +719,40 @@ static BOOL isDevServerRunning(void) {
         [self handleInitResources:modelName];
     }
     else if ([type isEqualToString:@"loadAudioPrompt"]) {
-        [self handleLoadAudioPrompt:0];
+        NSNumber* indexVal = body[@"index"];
+        [self handleLoadAudioPrompt:indexVal ? indexVal.intValue : 0];
+    }
+    else if ([type isEqualToString:@"loadAudioPromptData"]) {
+        NSNumber* indexVal = body[@"index"];
+        NSString* filename = body[@"filename"];
+        NSString* base64 = body[@"data"];
+        if (base64.length == 0) return;
+        NSData* data = [[NSData alloc] initWithBase64EncodedString:base64
+                                                          options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        if (!data) {
+            [self finishAudioPromptLoad:nil index:(indexVal ? indexVal.intValue : 0) success:NO];
+            return;
+        }
+        [self loadAudioPromptFromData:data
+                             filename:filename
+                                index:(indexVal ? indexVal.intValue : 0)];
     }
     else if ([type isEqualToString:@"clearAudioPrompt"]) {
         dispatch_async(dispatch_get_main_queue(), ^{
             RealtimeRunner* engine = [self engine];
             if (engine) {
-                engine->set_audio_prompt(0, "");
+                engine->set_audio_prompt_samples(0, "", nullptr, 0);
+            }
+            JamAudioUnit* au = [self jamAU];
+            NSString* restored = self->_currentPromptText;
+            if (restored.length == 0) {
+                restored = [[NSUserDefaults standardUserDefaults] stringForKey:@"Jam_Prompt"] ?: @"";
+            }
+            if (au) {
+                [au applyPromptTextToEngine:restored];
             }
             [self sendStateUpdate:@{
-                @"prompt": self->_currentPromptText ?: @"",
+                @"prompt": restored ?: @"",
                 @"isAudioPrompt": @NO,
             }];
         });
@@ -1026,73 +1056,135 @@ static BOOL isDevServerRunning(void) {
 
 // ─── Audio prompt loading ────────────────────────────────────────────────────
 
-- (void)loadAudioPromptFileAtPath:(NSString*)path index:(int)index {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        RealtimeRunner* engine = [self engine];
-        if (!engine) return;
+- (void)finishAudioPromptLoad:(NSString*)displayName index:(int)index success:(BOOL)success {
+    RealtimeRunner* engine = [self engine];
+    if (success && engine) {
+        float weights[6] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        engine->set_blend_weights(weights, 6);
+    }
+    [self sendStateUpdate:@{
+        @"prompt": success ? (displayName ?: @"Audio reference") : @"Error: Audio load failed",
+        @"isAudioPrompt": @(success),
+    }];
+}
 
-        NSString* filename = path.lastPathComponent;
-        BOOL readSuccess = NO;
-        NSURL* url = [NSURL fileURLWithPath:path];
+- (BOOL)decodeAudioPromptAtURL:(NSURL*)url
+                           index:(int)index
+                        filename:(NSString*)fallbackName {
+    RealtimeRunner* engine = [self engine];
+    if (!engine || !url) return NO;
 
-        ExtAudioFileRef extFile = nullptr;
-        OSStatus status = ExtAudioFileOpenURL((__bridge CFURLRef)url, &extFile);
-        if (status == noErr && extFile) {
-            AudioStreamBasicDescription clientFormat = {};
-            clientFormat.mSampleRate = 16000.0;
-            clientFormat.mFormatID = kAudioFormatLinearPCM;
-            clientFormat.mFormatFlags = kAudioFormatFlagIsFloat;
-            clientFormat.mBitsPerChannel = 32;
-            clientFormat.mChannelsPerFrame = 1;
-            clientFormat.mBytesPerFrame = 4;
-            clientFormat.mFramesPerPacket = 1;
-            clientFormat.mBytesPerPacket = 4;
+    NSString* displayName = fallbackName.length ? fallbackName : url.lastPathComponent;
+    BOOL readSuccess = NO;
 
-            status = ExtAudioFileSetProperty(extFile, kExtAudioFileProperty_ClientDataFormat,
-                                              sizeof(clientFormat), &clientFormat);
-            if (status == noErr) {
-                int maxFrames = 160000;
-                std::vector<float> samples(maxFrames, 0.0f);
-                AudioBufferList bufferList;
-                bufferList.mNumberBuffers = 1;
-                bufferList.mBuffers[0].mNumberChannels = 1;
-                bufferList.mBuffers[0].mDataByteSize = maxFrames * sizeof(float);
-                bufferList.mBuffers[0].mData = samples.data();
+    ExtAudioFileRef extFile = nullptr;
+    OSStatus status = ExtAudioFileOpenURL((__bridge CFURLRef)url, &extFile);
+    if (status == noErr && extFile) {
+        AudioStreamBasicDescription clientFormat = {};
+        clientFormat.mSampleRate = 16000.0;
+        clientFormat.mFormatID = kAudioFormatLinearPCM;
+        clientFormat.mFormatFlags = kAudioFormatFlagIsFloat;
+        clientFormat.mBitsPerChannel = 32;
+        clientFormat.mChannelsPerFrame = 1;
+        clientFormat.mBytesPerFrame = 4;
+        clientFormat.mFramesPerPacket = 1;
+        clientFormat.mBytesPerPacket = 4;
 
-                UInt32 framesToRead = maxFrames;
-                status = ExtAudioFileRead(extFile, &framesToRead, &bufferList);
-                if (status == noErr && framesToRead > 0) {
-                    if (framesToRead < (UInt32)maxFrames) {
-                        for (UInt32 i = framesToRead; i < (UInt32)maxFrames; ++i)
-                            samples[i] = samples[i % framesToRead];
+        status = ExtAudioFileSetProperty(extFile, kExtAudioFileProperty_ClientDataFormat,
+                                          sizeof(clientFormat), &clientFormat);
+        if (status == noErr) {
+            constexpr int maxFrames = 160000; // 10s @ 16 kHz mono
+            std::vector<float> samples(maxFrames, 0.0f);
+            AudioBufferList bufferList = {};
+            bufferList.mNumberBuffers = 1;
+            bufferList.mBuffers[0].mNumberChannels = 1;
+            bufferList.mBuffers[0].mDataByteSize = maxFrames * sizeof(float);
+            bufferList.mBuffers[0].mData = samples.data();
+
+            UInt32 framesToRead = maxFrames;
+            status = ExtAudioFileRead(extFile, &framesToRead, &bufferList);
+            if (status == noErr && framesToRead > 0) {
+                if (framesToRead < (UInt32)maxFrames) {
+                    for (UInt32 i = framesToRead; i < (UInt32)maxFrames; ++i) {
+                        samples[i] = samples[i % framesToRead];
                     }
-                    engine->set_audio_prompt_samples(index, filename.UTF8String, samples.data(), maxFrames);
-                    readSuccess = YES;
                 }
+                engine->set_audio_prompt_samples(index, displayName.UTF8String,
+                                                 samples.data(), maxFrames);
+                readSuccess = YES;
             }
-            ExtAudioFileDispose(extFile);
+        }
+        ExtAudioFileDispose(extFile);
+    }
+
+    if (!readSuccess) {
+        NSLog(@"Jam_AU: failed to decode audio reference at %@", url.path);
+    }
+    return readSuccess;
+}
+
+- (void)loadAudioPromptFromURL:(NSURL*)url index:(int)index accessGranted:(BOOL)accessGranted {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString* displayName = url.lastPathComponent;
+        BOOL success = [self decodeAudioPromptAtURL:url
+                                              index:index
+                                           filename:displayName];
+        if (accessGranted) {
+            [url stopAccessingSecurityScopedResource];
+        }
+        [self finishAudioPromptLoad:displayName index:index success:success];
+    });
+}
+
+- (void)loadAudioPromptFromData:(NSData*)data filename:(NSString*)filename index:(int)index {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSString* safeName = filename.length ? filename : @"reference.wav";
+        NSString* tempPath = [NSTemporaryDirectory()
+            stringByAppendingPathComponent:[NSString stringWithFormat:@"jam-ref-%@", safeName]];
+        if (![data writeToFile:tempPath atomically:YES]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self finishAudioPromptLoad:safeName index:index success:NO];
+            });
+            return;
         }
 
-        [self sendStateUpdate:@{
-            @"prompt": readSuccess ? filename : @"Error: Load failed",
-            @"isAudioPrompt": @(readSuccess),
-        }];
+        NSURL* url = [NSURL fileURLWithPath:tempPath];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BOOL success = [self decodeAudioPromptAtURL:url
+                                                  index:index
+                                               filename:safeName];
+            [self finishAudioPromptLoad:safeName index:index success:success];
+        });
     });
+}
+
+- (void)loadAudioPromptFileAtPath:(NSString*)path index:(int)index {
+    if (!path) return;
+    [self loadAudioPromptFromURL:[NSURL fileURLWithPath:path] index:index accessGranted:NO];
 }
 
 - (void)handleLoadAudioPrompt:(int)index {
     NSOpenPanel* panel = [NSOpenPanel openPanel];
     [panel setCanChooseFiles:YES];
     [panel setCanChooseDirectories:NO];
-    [panel setAllowedContentTypes:@[[UTType typeWithIdentifier:@"public.audio"]]];
-    [panel setMessage:@"Select an audio file for the prompt"];
+    [panel setAllowsMultipleSelection:NO];
+    [panel setAllowedContentTypes:@[
+        UTTypeAudio,
+        [UTType typeWithFilenameExtension:@"wav"],
+        [UTType typeWithFilenameExtension:@"mp3"],
+        [UTType typeWithFilenameExtension:@"m4a"],
+        [UTType typeWithFilenameExtension:@"aiff"],
+        [UTType typeWithFilenameExtension:@"aif"],
+    ]];
+    [panel setMessage:@"Select a WAV or MP3 file to use as an audio reference."];
 
     void (^completionBlock)(NSModalResponse) = ^(NSModalResponse result) {
         if (result != NSModalResponseOK) return;
         NSURL* url = [panel URL];
         if (!url) return;
 
-        [self loadAudioPromptFileAtPath:url.path index:index];
+        BOOL accessed = [url startAccessingSecurityScopedResource];
+        [self loadAudioPromptFromURL:url index:index accessGranted:accessed];
     };
 
     if (self.view.window) {

@@ -32,6 +32,12 @@ set(MAGENTA_RT_DIR "${CMAKE_SOURCE_DIR}/magenta-realtime")
 set(JAM_COMMON_DIR "${MAGENTA_RT_DIR}/examples/common")
 set(JAM_UI_DIR "${MAGENTA_RT_DIR}/examples/jam/ui")
 
+if(EXISTS "${CMAKE_SOURCE_DIR}/jam-ui-patches/App.tsx")
+  file(COPY "${CMAKE_SOURCE_DIR}/jam-ui-patches/App.tsx"
+       DESTINATION "${JAM_UI_DIR}/src/")
+  message(STATUS "Applied jam-ui-patches overlay to Jam React UI")
+endif()
+
 if(NOT EXISTS "${MAGENTA_RT_DIR}/core/CMakeLists.txt")
   message(FATAL_ERROR
     "magenta-realtime submodule is missing. Run:\n"
