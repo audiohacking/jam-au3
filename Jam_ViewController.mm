@@ -314,8 +314,10 @@ static BOOL isDevServerRunning(void) {
 // ─── Metrics polling (25 Hz) ─────────────────────────────────────────────────
 
 - (void)updateMetrics {
+    JamAudioUnit* au = [self jamAU];
+    if (au) [au pollOfflineState];
     RealtimeRunner* engine = [self engine];
-    JamSharedState* shared = [[self jamAU] sharedState];
+    JamSharedState* shared = [au sharedState];
     if (!engine) return;
 
     _metricsTicks++;

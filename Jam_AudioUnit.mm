@@ -338,6 +338,11 @@
 - (void)setRenderingOffline:(BOOL)renderingOffline {
     [super setRenderingOffline:renderingOffline];
     _isOffline = renderingOffline;
+    if (renderingOffline) {
+        // Ensure bounce/export renders audio even if the Jam UI play button is off.
+        _uiPlaying = YES;
+        _engine.set_bypass(false);
+    }
 }
 
 - (BOOL)shouldBypassEffect {
@@ -651,6 +656,13 @@ static OSStatus ConverterDataProc(AudioConverterRef inAudioConverter,
         float* tempL = unsafeSelf->_resampleBufferL;
         float* tempR = unsafeSelf->_resampleBufferR;
         float* tempInterleaved = unsafeSelf->_resampleBufferInterleaved;
+
+        // Read offline flag first. During bounce the audio thread uses blocking
+        // ring-buffer reads; inference-thread ring resets are undefined while
+        // the consumer is active (see ring_buffer.h).
+        bool isOffline = unsafeSelf->_isOffline;
+        engine->set_offline(isOffline);
+
         // Process parameter and MIDI events
         for (const AURenderEvent* event = realtimeEventListHead;
              event != nullptr; event = event->head.next) {
@@ -675,7 +687,7 @@ static OSStatus ConverterDataProc(AudioConverterRef inAudioConverter,
                 else if (paramEvent.parameterAddress >= 10 && paramEvent.parameterAddress <= 15) engine->set_blend_weight((int)paramEvent.parameterAddress - 10, paramEvent.value);
                 else if (paramEvent.parameterAddress == 31) {
                     bool isHigh = paramEvent.value > 0.5f;
-                    if (isHigh && !wasResetHigh) engine->trigger_reset();
+                    if (isHigh && !wasResetHigh && !isOffline) engine->trigger_reset();
                     wasResetHigh = isHigh;
                 }
                 else if (paramEvent.parameterAddress == 32) {
@@ -703,11 +715,6 @@ static OSStatus ConverterDataProc(AudioConverterRef inAudioConverter,
             }
         }
 
-        // Read offline flag from the ivar (plain C memory, no ObjC messaging).
-        // Updated every ~200ms by pollOfflineState on the main thread.
-        bool isOffline = unsafeSelf->_isOffline;
-        engine->set_offline(isOffline);
-
         // Read the transport block from the cached raw pointer (set once
         // by pollOfflineState on the main thread, never freed).
         __unsafe_unretained AUHostTransportStateBlock transportBlock =
@@ -715,58 +722,72 @@ static OSStatus ConverterDataProc(AudioConverterRef inAudioConverter,
 
         BOOL isDawPlaying = NO;
         BOOL isPlaying = unsafeSelf->_uiPlaying; // Start with UI play state
-        if (transportBlock) {
-            AUHostTransportStateFlags flags = 0;
-            double currentSamplePosition = 0;
-            double cycleStartBeatPosition = 0;
-            double cycleEndBeatPosition = 0;
-            if (transportBlock(&flags, &currentSamplePosition, &cycleStartBeatPosition, &cycleEndBeatPosition)) {
-                isDawPlaying = (flags & AUHostTransportStateMoving) != 0;
-                isPlaying = isPlaying || isDawPlaying;
-                engine->set_transport_flags((int)flags);
-            } else {
-                engine->set_transport_flags(-3);
-            }
-        } else {
-            engine->set_transport_flags(-2);
-        }
 
-        // If DAW was playing and has now stopped, stop the Audio Unit's playback as well.
-        if (wasDawPlaying && !isDawPlaying) {
-            unsafeSelf->_uiPlaying = NO;
-            isPlaying = NO;
-        }
-        wasDawPlaying = isDawPlaying;
-
-        // Edge detection from stopped to playing
-        if (isPlaying && !wasPlaying) {
-            engine->reset_for_playback();
-            if (resampler) {
-                AudioConverterReset(resampler);
-            }
-        }
-        wasPlaying = isPlaying;
-
-        // Auto-reset when currentBeatPosition is exactly 0. This edge-detects the
-        // transition to beat 0.0 so that resets are only triggered once (e.g., when the
-        // timeline loops back to start, but not repeatedly if user pauses at the start).
-        __unsafe_unretained AUHostMusicalContextBlock musicalContextBlock =
-            (__bridge AUHostMusicalContextBlock)(unsafeSelf->_musicalContextBlockPtr);
-
-        if (musicalContextBlock) {
-            double currentBeatPosition = 0;
-            if (musicalContextBlock(NULL, NULL, NULL, &currentBeatPosition, NULL, NULL)) {
-                if (currentBeatPosition == 0.0 && !wasBeatZero) {
-                    // Transport-rewind reset (DAW timeline jumped back to
-                    // beat 0). Suppressible: a freshly-prefilled context
-                    // arms a one-shot skip so re-cuing the DAW after
-                    // clicking Audio Prefill / Silent Prefill doesn't wipe
-                    // the prefill. User-initiated resets (resetModel,
-                    // param 31) take a different path and are never
-                    // suppressed.
-                    engine->trigger_transport_reset();
+        if (isOffline) {
+            // Logic bounce / offline export: always render. Do not run transport
+            // edge logic that can reset ring buffers while blocking reads are active.
+            isPlaying = YES;
+            if (transportBlock) {
+                AUHostTransportStateFlags flags = 0;
+                double currentSamplePosition = 0;
+                double cycleStartBeatPosition = 0;
+                double cycleEndBeatPosition = 0;
+                if (transportBlock(&flags, &currentSamplePosition, &cycleStartBeatPosition, &cycleEndBeatPosition)) {
+                    engine->set_transport_flags((int)flags);
+                } else {
+                    engine->set_transport_flags(-3);
                 }
-                wasBeatZero = (currentBeatPosition == 0.0);
+            } else {
+                engine->set_transport_flags(-2);
+            }
+            wasPlaying = YES;
+        } else {
+            if (transportBlock) {
+                AUHostTransportStateFlags flags = 0;
+                double currentSamplePosition = 0;
+                double cycleStartBeatPosition = 0;
+                double cycleEndBeatPosition = 0;
+                if (transportBlock(&flags, &currentSamplePosition, &cycleStartBeatPosition, &cycleEndBeatPosition)) {
+                    isDawPlaying = (flags & AUHostTransportStateMoving) != 0;
+                    isPlaying = isPlaying || isDawPlaying;
+                    engine->set_transport_flags((int)flags);
+                } else {
+                    engine->set_transport_flags(-3);
+                }
+            } else {
+                engine->set_transport_flags(-2);
+            }
+
+            // If DAW was playing and has now stopped, stop the Audio Unit's playback as well.
+            if (wasDawPlaying && !isDawPlaying) {
+                unsafeSelf->_uiPlaying = NO;
+                isPlaying = NO;
+            }
+            wasDawPlaying = isDawPlaying;
+
+            // Edge detection from stopped to playing
+            if (isPlaying && !wasPlaying) {
+                engine->reset_for_playback();
+                if (resampler) {
+                    AudioConverterReset(resampler);
+                }
+            }
+            wasPlaying = isPlaying;
+
+            // Auto-reset when currentBeatPosition is exactly 0. This edge-detects the
+            // transition to beat 0.0 so that resets are only triggered once (e.g., when the
+            // timeline loops back to start, but not repeatedly if user pauses at the start).
+            __unsafe_unretained AUHostMusicalContextBlock musicalContextBlock =
+                (__bridge AUHostMusicalContextBlock)(unsafeSelf->_musicalContextBlockPtr);
+
+            if (musicalContextBlock) {
+                double currentBeatPosition = 0;
+                if (musicalContextBlock(NULL, NULL, NULL, &currentBeatPosition, NULL, NULL)) {
+                    if (currentBeatPosition == 0.0 && !wasBeatZero) {
+                        engine->trigger_transport_reset();
+                    }
+                    wasBeatZero = (currentBeatPosition == 0.0);
+                }
             }
         }
 
