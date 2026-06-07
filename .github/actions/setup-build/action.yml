@@ -1,0 +1,57 @@
+name: Set up jam-au3 build
+description: Node, ccache, uv, and pinned CMake for CI builds
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+        cache: npm
+
+    - name: Install ccache
+      shell: bash
+      run: brew install ccache
+
+    - name: Restore ccache
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/.ccache
+        key: jam-au3-ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'magenta-realtime/core/**', 'Jam_AudioUnit.mm', 'Jam_ViewController.mm', 'Jam_AUHostApp.mm') }}
+        restore-keys: |
+          jam-au3-ccache-${{ runner.os }}-
+
+    - name: Configure ccache
+      shell: bash
+      run: |
+        echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> "$GITHUB_ENV"
+        echo "CCACHE_BASEDIR=${{ github.workspace }}" >> "$GITHUB_ENV"
+        echo "CCACHE_COMPRESS=true" >> "$GITHUB_ENV"
+        echo "CCACHE_COMPRESSLEVEL=6" >> "$GITHUB_ENV"
+        echo "CCACHE_MAXSIZE=4G" >> "$GITHUB_ENV"
+        echo "CCACHE_SLOPPINESS=clang_index_store,include_file_mtime,include_file_ctime,time_macros,pch_defines" >> "$GITHUB_ENV"
+        ccache --zero-stats || true
+
+    - name: Install npm workspaces
+      shell: bash
+      run: npm install
+
+    - name: Validate Jam UI build
+      shell: bash
+      run: npm run build --workspace=jam-ui
+
+    - uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: true
+
+    - name: Set up Python and CMake
+      shell: bash
+      run: |
+        uv python install 3.12
+        uv venv --python 3.12
+        source .venv/bin/activate
+        uv pip install "cmake<3.28"
+
+    - name: Print ccache status (before build)
+      shell: bash
+      run: ccache -s || true

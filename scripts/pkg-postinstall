@@ -1,0 +1,14 @@
+#!/bin/bash
+# pkg postinstall — register the embedded AUv3 extension after copying to /Applications.
+
+set -e
+
+APP="/Applications/Magenta Jam (AU).app"
+APPEX="${APP}/Contents/PlugIns/Jam_AU.appex"
+
+if [ -d "$APPEX" ]; then
+  pluginkit -a "$APPEX" 2>/dev/null || true
+  killall -9 AudioComponentRegistrar 2>/dev/null || true
+fi
+
+exit 0

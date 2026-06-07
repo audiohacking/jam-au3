@@ -1,0 +1,3 @@
+[submodule "magenta-realtime"]
+	path = magenta-realtime
+	url = https://github.com/magenta/magenta-realtime.git

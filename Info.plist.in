@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>${MACOSX_BUNDLE_EXECUTABLE_NAME}</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.audiohacking.jam.au</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Jam_AU</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon.icns</string>
+    <key>CFBundlePackageType</key>
+    <string>XPC!</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${MAGENTART_VERSION}</string>
+    <key>CFBundleVersion</key>
+    <string>${MAGENTART_VERSION}</string>
+    <key>NSExtension</key>
+    <dict>
+        <key>NSExtensionPointIdentifier</key>
+        <string>com.apple.AudioUnit-UI</string>
+        <key>NSExtensionPrincipalClass</key>
+        <string>JamViewController</string>
+        <key>NSExtensionAttributes</key>
+        <dict>
+            <key>AudioComponents</key>
+            <array>
+                <dict>
+                    <key>type</key>
+                    <string>aumu</string>
+                    <key>subtype</key>
+                    <string>JAM3</string>
+                    <key>manufacturer</key>
+                    <string>AHck</string>
+                    <key>name</key>
+                    <string>AudioHacking: Magenta Jam</string>
+                    <key>description</key>
+                    <string>Real-time AI jamming instrument</string>
+                    <key>factoryFunction</key>
+                    <string>JamViewController</string>
+                    <key>version</key>
+                    <integer>1</integer>
+                    <key>sandboxSafe</key>
+                    <true/>
+                    <key>tags</key>
+                    <array>
+                        <string>Synthesizer</string>
+                    </array>
+                </dict>
+            </array>
+        </dict>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,8 @@
+{
+  "name": "jam-au3",
+  "private": true,
+  "workspaces": [
+    "magenta-realtime/examples/common/react_ui",
+    "magenta-realtime/examples/jam/ui"
+  ]
+}
