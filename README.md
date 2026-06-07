@@ -1,5 +1,7 @@
 # Magenta Jam AUv3
 
+<img width="400" src="https://github.com/user-attachments/assets/669ec28f-b6fe-4d90-85b5-a9485393ee01" />
+
 AUv3 instrument plugin wrapping the [Magenta RealTime Jam](https://github.com/magenta/magenta-realtime/tree/main/examples/jam) experience for use inside DAWs.
 
 Built with the same CMake + Magenta framework patterns as [mrt2-au3](https://github.com/audiohacking/mrt2-au3).
@@ -12,6 +14,15 @@ Built with the same CMake + Magenta framework patterns as [mrt2-au3](https://git
 - Python 3.12 + [uv](https://github.com/astral-sh/uv)
 
 ## Quick start
+
+### Download AU3 Plugin
+
+Download the [latest release](https://github.com/audiohacking/jam-au3/releases) and install it on your system
+
+Copy `Magenta Jam (AU).app` to your Apps folder and run once to register the extension in your DAW
+
+
+### Build AU3 Plugin
 
 ```bash
 git clone --recurse-submodules https://github.com/audiohacking/jam-au3.git
