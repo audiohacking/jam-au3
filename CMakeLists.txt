@@ -215,9 +215,10 @@ set_source_files_properties(${APP_ICON} PROPERTIES MACOSX_PACKAGE_LOCATION "Reso
 add_executable(jam_au MACOSX_BUNDLE
   Jam_AudioUnit.mm
   Jam_ViewController.mm
+  JamModelPaths.mm
+  JamModelDownloader.mm
   ${JAM_COMMON_DIR}/cpp/magenta_paths.cpp
   ${JAM_COMMON_DIR}/objc/MagentaModelManager.mm
-  ${JAM_COMMON_DIR}/objc/MagentaModelDownloader.mm
   ${JAM_COMMON_DIR}/objc/MagentaSettings.mm
   ${APP_ICON}
 )

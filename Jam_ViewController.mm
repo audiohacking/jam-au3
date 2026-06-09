@@ -21,7 +21,8 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import "MagentaModelManager.h"
-#import "MagentaModelDownloader.h"
+#import "JamModelDownloader.h"
+#import "JamModelPaths.h"
 #import "MagentaSettings.h"
 #include "magenta_paths.h"
 #include <sys/socket.h>
@@ -32,6 +33,15 @@ using magentart::core::RealtimeRunner;
 using magentart::core::EngineMetrics;
 
 // ─── Models folder helpers (aligned with mrt2-au3 AU sandbox patterns) ───────
+
+static dispatch_queue_t JamBootstrapQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("com.audiohacking.jam.bootstrap", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
 
 static NSData* JamModelsFolderBookmark(void) {
     NSData* bookmark = [[NSUserDefaults standardUserDefaults] objectForKey:@"DownloadFolderBookmark"];
@@ -58,23 +68,85 @@ static void JamClearModelsFolderBookmarks(void) {
     [defaults removeObjectForKey:@"MagentaRT_ModelFolderPath"];
 }
 
-/// If `baseURL` has no models directly, try a `models/` child (e.g. user picked magenta-rt-v2 root).
+static NSURL* JamURLFromPath(NSString* path) {
+    return path.length > 0 ? [NSURL fileURLWithPath:path isDirectory:YES] : nil;
+}
+
+static NSArray<NSURL*>* JamModelsSearchCandidates(NSURL* baseURL) {
+    NSMutableOrderedSet<NSURL*>* candidates = [NSMutableOrderedSet orderedSet];
+    void (^addPath)(NSString*) = ^(NSString* path) {
+        NSURL* url = JamURLFromPath(path);
+        if (url) [candidates addObject:url];
+    };
+
+    if (baseURL) {
+        [candidates addObject:baseURL];
+        addPath([baseURL.path stringByAppendingPathComponent:@"models"]);
+        addPath([baseURL.path stringByAppendingPathComponent:@"magenta-rt-v2/models"]);
+    }
+
+    for (NSString* path in [JamModelPaths defaultModelsSearchPaths]) {
+        addPath(path);
+        addPath([path stringByAppendingPathComponent:@"models"]);
+        addPath([path stringByAppendingPathComponent:@"magenta-rt-v2/models"]);
+    }
+
+    return candidates.array;
+}
+
+/// Resolve the first directory under `baseURL` (or standard Magenta layouts) that contains models.
 static NSURL* JamEffectiveModelsDirectoryURL(NSURL* baseURL) {
-    if (!baseURL) return nil;
-
-    NSArray<NSString*>* direct = [MagentaModelManager listLocalModelsInDirectory:baseURL];
-    if (direct.count > 0) return baseURL;
-
-    NSURL* modelsSub = [baseURL URLByAppendingPathComponent:@"models" isDirectory:YES];
-    BOOL isDir = NO;
-    if ([[NSFileManager defaultManager] fileExistsAtPath:modelsSub.path isDirectory:&isDir] && isDir) {
-        NSArray<NSString*>* nested = [MagentaModelManager listLocalModelsInDirectory:modelsSub];
-        if (nested.count > 0) {
-            NSLog(@"Jam_AU: using models/ subdirectory under %@", baseURL.path);
-            return modelsSub;
+    for (NSURL* candidate in JamModelsSearchCandidates(baseURL)) {
+        NSArray<NSString*>* models = [MagentaModelManager listLocalModelsInDirectory:candidate];
+        if (models.count > 0) {
+            if (baseURL && ![candidate.path isEqualToString:baseURL.path]) {
+                NSLog(@"Jam_AU: using models directory %@", candidate.path);
+            }
+            return candidate;
         }
     }
-    return baseURL;
+    if (baseURL) return baseURL;
+    return JamURLFromPath([MagentaModelManager defaultModelsDirectory]);
+}
+
+static BOOL JamSharedResourcesAvailable(JamAudioUnit* au) {
+    if ([JamModelPaths sharedResourcesAvailableOnDisk]) {
+        return YES;
+    }
+    return au && [au hasInitializedAssets];
+}
+
+static NSString* JamSandboxAwareResourcesPath(NSString* selectedPath) {
+    if (selectedPath.length == 0) {
+        return [JamModelPaths resolveResourcesPath];
+    }
+
+    NSArray<NSString*>* candidates = @[
+        selectedPath,
+        [selectedPath stringByAppendingPathComponent:@"resources"],
+        [selectedPath stringByAppendingPathComponent:@"magenta-rt-v2/resources"],
+    ];
+    for (NSString* candidate in candidates) {
+        if ([JamModelPaths resourcesValidAtPath:candidate]) {
+            return candidate;
+        }
+    }
+    return [JamModelPaths resolveResourcesPath];
+}
+
+static NSString* JamPreferredModelName(NSArray<NSString*>* modelFiles) {
+    if (modelFiles.count == 0) return nil;
+    NSString* preferred = [[NSUserDefaults standardUserDefaults] stringForKey:@"Jam_LoadedModelName"];
+    if (!preferred) {
+        preferred = [[NSUserDefaults standardUserDefaults] stringForKey:@"LoadedModelName"];
+    }
+    if (preferred.length > 0 && [modelFiles containsObject:preferred]) {
+        return preferred;
+    }
+    if ([modelFiles containsObject:@"mrt2_small"]) {
+        return @"mrt2_small";
+    }
+    return modelFiles[0];
 }
 
 /// Resolve bookmarked (or default) models directory. Optionally returns scoped base URL for stopAccessing.
@@ -130,17 +202,6 @@ static NSURL* JamResolveModelsDirectory(BOOL* outAccessGranted, NSURL** outScope
     }
 
     return effectiveURL;
-}
-
-static NSString* JamSandboxAwareResourcesPath(NSString* selectedPath) {
-    NSString* customResourcesPath = [selectedPath stringByAppendingPathComponent:@"resources"];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:customResourcesPath]) {
-        return customResourcesPath;
-    }
-    NSString* home = NSHomeDirectory();
-    NSRange range = [home rangeOfString:@"/Library/Containers/"];
-    NSString* realHome = (range.location != NSNotFound) ? [home substringToIndex:range.location] : home;
-    return [realHome stringByAppendingPathComponent:@"Documents/Magenta/magenta-rt-v2/resources"];
 }
 
 // ─── Dev server probe ────────────────────────────────────────────────────────
@@ -200,6 +261,7 @@ static BOOL isDevServerRunning(void) {
 - (NSString*)mlxfnPathForModelAtURL:(NSURL*)modelURL;
 - (void)saveLoadedModelBookmarkForURL:(NSURL*)modelURL modelName:(NSString*)modelName;
 - (void)autoLoadSavedModelIfNeeded;
+- (void)runAutoLoadBootstrap;
 - (void)tryAutoLoadFromModelsDirectory;
 - (void)promptForModelsFolderIfNeeded;
 - (BOOL)decodeAudioPromptAtURL:(NSURL*)url
@@ -221,6 +283,8 @@ static BOOL isDevServerRunning(void) {
     NSString* _currentPromptText;
     BOOL _isPlaying;
     BOOL _promptedForModelsFolder;
+    BOOL _autoLoadScheduled;
+    BOOL _downloadInProgress;
 }
 
 // ─── Parameter bridging ──────────────────────────────────────────────────────
@@ -519,7 +583,8 @@ static BOOL isDevServerRunning(void) {
     state[@"hostMode"] = @"auv3";
     state[@"computerKeyboardMidi"] = @YES;
 
-    state[@"resourcesMissing"] = @(![MagentaModelDownloader areSharedResourcesValid]);
+    [JamModelPaths ensureCustomResourcesPath];
+    state[@"resourcesMissing"] = @(!JamSharedResourcesAvailable(jamAU));
 
     [self sendStateUpdate:state];
     [self handleListLocalModels];
@@ -655,7 +720,7 @@ static BOOL isDevServerRunning(void) {
         [self handleListLocalModels];
     }
     else if ([type isEqualToString:@"listRemoteModels"]) {
-        [MagentaModelDownloader listRemoteModelsWithCompletion:^(NSArray<NSString *> *models, NSError *error) {
+        [JamModelDownloader listRemoteModelsWithCompletion:^(NSArray<NSString *> *models, NSError *error) {
             if (error) {
                 [self sendStateUpdate:@{@"remoteModelsError": error.localizedDescription}];
             } else {
@@ -666,7 +731,12 @@ static BOOL isDevServerRunning(void) {
     else if ([type isEqualToString:@"downloadModel"]) {
         NSString* name = body[@"name"];
         if (name) {
-            [MagentaModelDownloader downloadModel:name progress:^(double progress, NSString *status) {
+            if (_downloadInProgress) {
+                NSLog(@"Jam_AU: downloadModel: download already in progress");
+                return;
+            }
+            _downloadInProgress = YES;
+            [JamModelDownloader downloadModel:name progress:^(double progress, NSString *status) {
                 [self sendStateUpdate:@{
                     @"downloadProgress": @{
                         @"status": @"downloading",
@@ -676,6 +746,7 @@ static BOOL isDevServerRunning(void) {
                     }
                 }];
             } completion:^(BOOL success, NSError *error) {
+                self->_downloadInProgress = NO;
                 if (success) {
                     [self sendStateUpdate:@{
                         @"downloadProgress": @{
@@ -910,65 +981,70 @@ static BOOL isDevServerRunning(void) {
 }
 
 - (void)autoLoadSavedModelIfNeeded {
+    if (!self->_audioUnit) return;
+    if (_autoLoadScheduled) return;
+    _autoLoadScheduled = YES;
+
+    dispatch_async(JamBootstrapQueue(), ^{
+        [self runAutoLoadBootstrap];
+    });
+}
+
+- (void)runAutoLoadBootstrap {
+    if (!self->_audioUnit) return;
     JamAudioUnit* au = [self jamAU];
     RealtimeRunner* engine = [self engine];
     if (!au || !engine || engine->is_loaded()) return;
 
-    if (au.modelBookmark) {
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            BOOL stale = NO;
-            NSError* error = nil;
-            NSURL* url = [NSURL URLByResolvingBookmarkData:au.modelBookmark
-                                                   options:NSURLBookmarkResolutionWithoutUI | NSURLBookmarkResolutionWithSecurityScope
-                                             relativeToURL:nil
-                                       bookmarkDataIsStale:&stale
-                                                     error:&error];
-            if (url && [url startAccessingSecurityScopedResource]) {
-                NSString* mlxfnPath = [self mlxfnPathForModelAtURL:url];
-                if (mlxfnPath && [self loadModelAtPath:mlxfnPath]) {
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [self saveLoadedModelBookmarkForURL:url modelName:au.modelName ?: mlxfnPath.lastPathComponent];
-                    });
-                }
-                [url stopAccessingSecurityScopedResource];
-                return;
+    if (![au ensureAssetsInitialized]) {
+        NSLog(@"Jam_AU: runAutoLoadBootstrap: assets not initialized");
+        return;
+    }
+
+    auto tryBookmark = ^BOOL(NSData* bookmarkData, NSString* logLabel) {
+        if (!bookmarkData) return NO;
+        BOOL stale = NO;
+        NSError* error = nil;
+        NSURL* url = [NSURL URLByResolvingBookmarkData:bookmarkData
+                                               options:NSURLBookmarkResolutionWithoutUI | NSURLBookmarkResolutionWithSecurityScope
+                                         relativeToURL:nil
+                                   bookmarkDataIsStale:&stale
+                                                 error:&error];
+        if (!url) {
+            NSLog(@"Jam_AU: %@: bookmark resolve failed: %@", logLabel, error);
+            return NO;
+        }
+        if (![url startAccessingSecurityScopedResource]) {
+            NSLog(@"Jam_AU: %@: security scope failed for %@", logLabel, url.path);
+            return NO;
+        }
+
+        NSString* mlxfnPath = [self mlxfnPathForModelAtURL:url];
+        BOOL loaded = mlxfnPath && [self loadModelAtPath:mlxfnPath];
+        if (loaded) {
+            NSString* savedModelName = [[NSUserDefaults standardUserDefaults] stringForKey:@"Jam_LoadedModelName"];
+            if (!savedModelName) {
+                savedModelName = [[NSUserDefaults standardUserDefaults] stringForKey:@"LoadedModelName"];
             }
-            NSLog(@"Jam_AU: Failed to resolve AU model bookmark: %@", error);
-        });
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self saveLoadedModelBookmarkForURL:url
+                                          modelName:savedModelName ?: au.modelName ?: mlxfnPath.lastPathComponent];
+            });
+        }
+        [url stopAccessingSecurityScopedResource];
+        return loaded;
+    };
+
+    if (au.modelBookmark && tryBookmark(au.modelBookmark, @"connectToEngine AU bookmark")) {
         return;
     }
 
     NSData* savedBookmark = [[NSUserDefaults standardUserDefaults] objectForKey:@"LoadedModelBookmark"];
     if (savedBookmark) {
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            BOOL stale = NO;
-            NSError* error = nil;
-            NSURL* url = [NSURL URLByResolvingBookmarkData:savedBookmark
-                                                   options:NSURLBookmarkResolutionWithoutUI | NSURLBookmarkResolutionWithSecurityScope
-                                             relativeToURL:nil
-                                       bookmarkDataIsStale:&stale
-                                                     error:&error];
-            if (url && [url startAccessingSecurityScopedResource]) {
-                NSString* mlxfnPath = [self mlxfnPathForModelAtURL:url];
-                if (mlxfnPath && [self loadModelAtPath:mlxfnPath]) {
-                    NSString* savedModelName = [[NSUserDefaults standardUserDefaults] stringForKey:@"Jam_LoadedModelName"];
-                    if (!savedModelName) {
-                        savedModelName = [[NSUserDefaults standardUserDefaults] stringForKey:@"LoadedModelName"];
-                    }
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [self saveLoadedModelBookmarkForURL:url
-                                                  modelName:savedModelName ?: mlxfnPath.lastPathComponent];
-                    });
-                }
-                [url stopAccessingSecurityScopedResource];
-                return;
-            }
-            NSLog(@"Jam_AU: Failed to resolve saved model bookmark: %@", error);
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self tryAutoLoadFromModelsDirectory];
-            });
-        });
-        return;
+        NSLog(@"Jam_AU: Auto-loading model from saved bookmark...");
+        if (tryBookmark(savedBookmark, @"connectToEngine saved bookmark")) {
+            return;
+        }
     }
 
     [self tryAutoLoadFromModelsDirectory];
@@ -978,31 +1054,31 @@ static BOOL isDevServerRunning(void) {
     RealtimeRunner* engine = [self engine];
     if (!engine || engine->is_loaded()) return;
 
+    JamAudioUnit* au = [self jamAU];
+    if (au && ![au ensureAssetsInitialized]) {
+        NSLog(@"Jam_AU: tryAutoLoadFromModelsDirectory: assets not initialized");
+        return;
+    }
+
     BOOL accessGranted = NO;
     NSURL* scopedBase = nil;
     NSURL* modelsDir = JamResolveModelsDirectory(&accessGranted, &scopedBase);
     NSArray<NSString*>* modelFiles = [MagentaModelManager listLocalModelsInDirectory:modelsDir];
     if (modelFiles.count == 0) {
         if (accessGranted && scopedBase) [scopedBase stopAccessingSecurityScopedResource];
-        [self promptForModelsFolderIfNeeded];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self promptForModelsFolderIfNeeded];
+        });
         return;
     }
 
-    NSString* preferred = [[NSUserDefaults standardUserDefaults] stringForKey:@"Jam_LoadedModelName"];
-    if (!preferred) {
-        preferred = [[NSUserDefaults standardUserDefaults] stringForKey:@"LoadedModelName"];
-    }
-    if (!preferred || ![modelFiles containsObject:preferred]) {
-        preferred = @"mrt2_small";
-        if (![modelFiles containsObject:preferred]) {
-            preferred = modelFiles[0];
-        }
-    }
-
+    NSString* preferred = JamPreferredModelName(modelFiles);
     NSURL* modelURL = [modelsDir URLByAppendingPathComponent:preferred];
     NSString* mlxfnPath = [self mlxfnPathForModelAtURL:modelURL];
     if (mlxfnPath && [self loadModelAtPath:mlxfnPath]) {
-        [self saveLoadedModelBookmarkForURL:modelURL modelName:preferred];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self saveLoadedModelBookmarkForURL:modelURL modelName:preferred];
+        });
     }
 
     if (accessGranted && scopedBase) {
@@ -1202,37 +1278,41 @@ static BOOL isDevServerRunning(void) {
                 JamSaveModelsFolderBookmark(selectedPath, bookmarkData);
 
                 NSString *resourcesPathToLoad = JamSandboxAwareResourcesPath(selectedPath);
+                if (self->_audioUnit) {
+                    [[NSUserDefaults standardUserDefaults] setObject:resourcesPathToLoad
+                                                              forKey:@"MagentaRT_CustomResourcesPath"];
+                }
 
-                RealtimeRunner* engine = [self engine];
-                if (engine) {
-                    if (!engine->init_assets(resourcesPathToLoad.UTF8String)) {
-                        NSLog(@"Jam_AU: Failed to initialize assets from path: %@", resourcesPathToLoad);
-                    } else {
-                        NSLog(@"Jam_AU: Successfully initialized assets from path: %@", resourcesPathToLoad);
-                        [[NSUserDefaults standardUserDefaults] setObject:resourcesPathToLoad forKey:@"MagentaRT_CustomResourcesPath"];
+                dispatch_async(JamBootstrapQueue(), ^{
+                    JamAudioUnit* au = [self jamAU];
+                    if (au) {
+                        [au ensureAssetsInitialized];
                     }
-                }
 
-                [self sendStateUpdate:@{
-                    @"downloadPath": selectedPath,
-                    @"resourcesMissing": @(![MagentaModelDownloader areSharedResourcesValid])
-                }];
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [JamModelPaths ensureCustomResourcesPath];
+                        JamAudioUnit* auMain = [self jamAU];
+                        [self sendStateUpdate:@{
+                            @"downloadPath": selectedPath,
+                            @"resourcesMissing": @(!JamSharedResourcesAvailable(auMain))
+                        }];
+                        [self handleListLocalModels];
 
-                [self handleListLocalModels];
-
-                // Auto-load first model using security-scoped bookmark (not raw path).
-                BOOL accessGranted = NO;
-                NSURL* scopedBase = nil;
-                NSURL* modelsDir = JamResolveModelsDirectory(&accessGranted, &scopedBase);
-                NSArray<NSString *> *modelFiles = [MagentaModelManager listLocalModelsInDirectory:modelsDir];
-                if (accessGranted && scopedBase) {
-                    [scopedBase stopAccessingSecurityScopedResource];
-                }
-                if (modelFiles.count > 0) {
-                    [self handleSelectModel:modelFiles[0]];
-                } else {
-                    NSLog(@"Jam_AU: no models found under %@ (effective: %@)", selectedPath, modelsDir.path);
-                }
+                        BOOL accessGranted = NO;
+                        NSURL* scopedBase = nil;
+                        NSURL* modelsDir = JamResolveModelsDirectory(&accessGranted, &scopedBase);
+                        NSArray<NSString *> *modelFiles = [MagentaModelManager listLocalModelsInDirectory:modelsDir];
+                        if (accessGranted && scopedBase) {
+                            [scopedBase stopAccessingSecurityScopedResource];
+                        }
+                        NSString* preferred = JamPreferredModelName(modelFiles);
+                        if (preferred) {
+                            [self handleSelectModel:preferred];
+                        } else {
+                            NSLog(@"Jam_AU: no models found under %@ (effective: %@)", selectedPath, modelsDir.path);
+                        }
+                    });
+                });
             });
         } else if (error) {
             NSLog(@"Jam_AU: Failed to create folder bookmark: %@", error.localizedDescription);
@@ -1254,11 +1334,16 @@ static BOOL isDevServerRunning(void) {
         [scopedBase stopAccessingSecurityScopedResource];
     }
 
-    [self sendStateUpdate:@{@"localModels": modelFiles}];
+    NSMutableDictionary* update = [NSMutableDictionary dictionaryWithObject:modelFiles forKey:@"localModels"];
+    if (modelFiles.count > 0 && JamSharedResourcesAvailable([self jamAU])) {
+        update[@"resourcesMissing"] = @NO;
+    }
+    [self sendStateUpdate:update];
 }
 
 - (void)handleSelectModel:(NSString*)modelName {
-    dispatch_async(dispatch_get_main_queue(), ^{
+    dispatch_async(JamBootstrapQueue(), ^{
+        if (!self->_audioUnit) return;
         if (![self engine]) return;
 
         BOOL accessGranted = NO;
@@ -1269,13 +1354,18 @@ static BOOL isDevServerRunning(void) {
         NSString* mlxfnPath = [self mlxfnPathForModelAtURL:modelURL];
 
         if (!mlxfnPath) {
-            [self sendStateUpdate:@{@"modelName": @"No .mlxfn found"}];
+            NSLog(@"Jam_AU: selectModel: no .mlxfn for '%@' in %@", modelName, modelsDir.path);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self sendStateUpdate:@{@"modelName": @"No .mlxfn found"}];
+            });
             if (accessGranted && scopedBase) [scopedBase stopAccessingSecurityScopedResource];
             return;
         }
 
         if ([self loadModelAtPath:mlxfnPath]) {
-            [self saveLoadedModelBookmarkForURL:modelURL modelName:modelName];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self saveLoadedModelBookmarkForURL:modelURL modelName:modelName];
+            });
         }
 
         if (accessGranted && scopedBase) {
@@ -1309,12 +1399,38 @@ static BOOL isDevServerRunning(void) {
 }
 
 - (void)handleInitResources:(NSString *)modelName {
-    BOOL hasModel = modelName && modelName.length > 0;
+    if (!modelName || modelName.length == 0) {
+        modelName = @"mrt2_small";
+    }
+    if (_downloadInProgress) {
+        NSLog(@"Jam_AU: handleInitResources: download already in progress");
+        return;
+    }
+    _downloadInProgress = YES;
 
-    [MagentaModelDownloader initializeSharedResourcesWithProgress:^(double progress, NSString *status) {
+    NSString* destPath = [JamModelDownloader magentaHomePath];
+    NSLog(@"Jam_AU: handleInitResources: downloading to %@", destPath);
+
+    NSError* readyError = nil;
+    if (![JamModelDownloader ensureMagentaHomeReady:&readyError]) {
+        _downloadInProgress = NO;
+        [self sendStateUpdate:@{
+            @"resourcesProgress": @{
+                @"status": @"error",
+                @"percent": @(0.0),
+                @"text": readyError.localizedDescription ?: @"Cannot create Magenta folder"
+            }
+        }];
+        return;
+    }
+
+    BOOL hasModel = modelName.length > 0;
+
+    [JamModelDownloader initializeSharedResourcesWithProgress:^(double progress, NSString *status) {
         double scaledPercent = hasModel ? progress * 0.5 : progress;
-        NSString *statusWithProgress = [NSString stringWithFormat:@"[1/2] Shared assets: %@", status];
-        if (!hasModel) statusWithProgress = status;
+        NSString *statusWithProgress = hasModel
+            ? [NSString stringWithFormat:@"[1/2] Shared assets: %@", status]
+            : status;
 
         [self sendStateUpdate:@{
             @"resourcesProgress": @{
@@ -1325,6 +1441,7 @@ static BOOL isDevServerRunning(void) {
         }];
     } completion:^(BOOL success, NSError *error) {
         if (!success) {
+            self->_downloadInProgress = NO;
             [self sendStateUpdate:@{
                 @"resourcesProgress": @{
                     @"status": @"error",
@@ -1335,9 +1452,10 @@ static BOOL isDevServerRunning(void) {
             return;
         }
 
+        [JamModelPaths ensureCustomResourcesPath];
+
         if (hasModel) {
-            // Start downloading the selected model
-            [MagentaModelDownloader downloadModel:modelName progress:^(double progress, NSString *status) {
+            [JamModelDownloader downloadModel:modelName progress:^(double progress, NSString *status) {
                 double scaledPercent = 0.5 + (progress * 0.5);
                 [self sendStateUpdate:@{
                     @"resourcesProgress": @{
@@ -1346,57 +1464,56 @@ static BOOL isDevServerRunning(void) {
                         @"text": [NSString stringWithFormat:@"[2/2] Model: %@", status]
                     }
                 }];
-            } completion:^(BOOL success, NSError *error) {
-                if (success) {
-                    // Re-initialize the C++ engine assets with the newly downloaded resources!
-                    std::string resources = magentart::paths::get_resources_dir();
-                    if (![self engine]->init_assets(resources.c_str())) {
-                        NSLog(@"Jam: Failed to re-initialize C++ assets after onboarding download");
-                    } else {
-                        NSLog(@"Jam: Successfully initialized C++ assets after onboarding download");
-                    }
-
+            } completion:^(BOOL dlSuccess, NSError *dlError) {
+                self->_downloadInProgress = NO;
+                if (dlSuccess) {
                     [self sendStateUpdate:@{
                         @"resourcesProgress": @{
                             @"status": @"success",
                             @"percent": @(1.0),
-                            @"text": @"Onboarding Completed!"
+                            @"text": @"Setup Complete!"
                         },
                         @"resourcesMissing": @NO
                     }];
-                    // Re-list local models so it immediately appears in local list
-                    [self handleListLocalModels];
-
-                    // Programmatically select and load the newly downloaded model into the C++ engine
-                    [self handleSelectModel:modelName];
+                    dispatch_async(JamBootstrapQueue(), ^{
+                        JamAudioUnit* au = [self jamAU];
+                        if (au) {
+                            [au ensureAssetsInitialized];
+                        }
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            [self handleListLocalModels];
+                            [self handleSelectModel:modelName];
+                        });
+                    });
                 } else {
                     [self sendStateUpdate:@{
                         @"resourcesProgress": @{
                             @"status": @"error",
                             @"percent": @(0.5),
-                            @"text": error.localizedDescription ?: @"Model download failed"
+                            @"text": dlError.localizedDescription ?: @"Model Download Failed"
                         }
                     }];
                 }
             }];
         } else {
-            // Finished resources download only
-            // Re-initialize the C++ engine assets with the newly downloaded resources!
-            std::string resources = magentart::paths::get_resources_dir();
-            if (![self engine]->init_assets(resources.c_str())) {
-                NSLog(@"Jam: Failed to re-initialize C++ assets after onboarding download");
-            } else {
-                NSLog(@"Jam: Successfully initialized C++ assets after onboarding download");
-            }
-
+            self->_downloadInProgress = NO;
             [self sendStateUpdate:@{
                 @"resourcesProgress": @{
                     @"status": @"success",
                     @"percent": @(1.0),
-                    @"text": @"Initialization Completed!"
+                    @"text": @"Setup Complete!"
                 },
                 @"resourcesMissing": @NO
             }];
+            dispatch_async(JamBootstrapQueue(), ^{
+                JamAudioUnit* au = [self jamAU];
+                if (au) {
+                    [au ensureAssetsInitialized];
+                }
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self handleListLocalModels];
+                });
+            });
         }
     }];
 }

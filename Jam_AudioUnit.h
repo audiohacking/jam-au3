@@ -24,6 +24,9 @@ using magentart::core::RealtimeRunner;
 - (std::atomic<bool>*)soloMode;
 - (std::atomic<float>*)cfgNotesSliderValue;
 - (void)applyPromptTextToEngine:(NSString*)prompt;
+- (BOOL)hasInitializedAssets;
+/// Resolve resources on disk and call init_assets if not already loaded.
+- (BOOL)ensureAssetsInitialized;
 
 @end
 

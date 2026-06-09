@@ -16,9 +16,10 @@
 
 #import "Jam_AudioUnit.h"
 #import <AVFoundation/AVFoundation.h>
-#import "MagentaModelDownloader.h"
+#import "JamModelPaths.h"
 #include "magenta_paths.h"
 #include "MagentaSettings.h"
+#include <mutex>
 
 @interface JamAudioUnit ()
 #if MAGENTART_DEBUG_LOG
@@ -54,6 +55,7 @@
     std::atomic<float> _gateDecaySeconds;
     std::atomic<float> _cfgNotesSliderValue;
     std::atomic<float> _cfgNotesCurrentLevel;
+    std::mutex _assetsInitMutex;
 }
 
 // Fallback init — the extension system may call plain init before the factory method.
@@ -92,16 +94,11 @@
     _cfgNotesSliderValue.store(savedCfgNotes > 0.0f ? savedCfgNotes : kMagentaDefaultCfgNotes,
                                std::memory_order_relaxed);
 
-    NSString* customResources = [[NSUserDefaults standardUserDefaults] stringForKey:@"MagentaRT_CustomResourcesPath"];
-    std::string resourcesPath = customResources
-        ? std::string(customResources.UTF8String)
-        : magentart::paths::get_resources_dir();
-    if (_engine.init_assets(resourcesPath.c_str())) {
-        _modelLoaded = YES;
-        _engine.load_musiccoca_model(resourcesPath.c_str(), "musiccoca");
-    } else {
-        NSLog(@"Jam_AU: Failed to load static assets externally from: %s", resourcesPath.c_str());
+    // init_assets runs only on JamBootstrapQueue (see ensureAssetsInitialized / connectToEngine).
+    if (!self.logHistory) {
+        self.logHistory = [NSMutableArray array];
     }
+    [self.logHistory addObject:@"init_assets deferred — will retry when UI connects"];
 
     auto makeParam = ^(NSString* ident, NSString* name, AUParameterAddress addr, float min, float max, float def) {
         AUParameter* p = [AUParameterTree
@@ -883,6 +880,42 @@ static OSStatus ConverterDataProc(AudioConverterRef inAudioConverter,
 - (std::atomic<bool>*)soloMode { return &_soloMode; }
 
 - (std::atomic<float>*)cfgNotesSliderValue { return &_cfgNotesSliderValue; }
+
+- (BOOL)hasInitializedAssets {
+    return _modelLoaded;
+}
+
+- (BOOL)ensureAssetsInitialized {
+    std::lock_guard<std::mutex> lock(_assetsInitMutex);
+
+    [JamModelPaths ensureCustomResourcesPath];
+
+    NSString* resourcesPath = [[NSUserDefaults standardUserDefaults] stringForKey:@"MagentaRT_CustomResourcesPath"];
+    if (resourcesPath.length == 0 || ![JamModelPaths resourcesValidAtPath:resourcesPath]) {
+        resourcesPath = [JamModelPaths resolveResourcesPath];
+    }
+    if (resourcesPath.length == 0 || ![JamModelPaths resourcesValidAtPath:resourcesPath]) {
+        return NO;
+    }
+
+    if (_modelLoaded) {
+        return YES;
+    }
+
+    _modelLoaded = _engine.init_assets(resourcesPath.UTF8String);
+    if (_modelLoaded) {
+        [[NSUserDefaults standardUserDefaults] setObject:resourcesPath forKey:@"MagentaRT_CustomResourcesPath"];
+        _engine.load_musiccoca_model(resourcesPath.UTF8String, "musiccoca");
+        NSLog(@"Jam_AU: ensureAssetsInitialized OK at %@", resourcesPath);
+    } else {
+        NSLog(@"Jam_AU: ensureAssetsInitialized FAILED at %@", resourcesPath);
+        if (!self.logHistory) {
+            self.logHistory = [NSMutableArray array];
+        }
+        [self.logHistory addObject:[NSString stringWithFormat:@"init_assets FAILED: %@", resourcesPath]];
+    }
+    return _modelLoaded;
+}
 
 - (void)setNoteOn:(uint8_t)note on:(BOOL)on {
     if (on) {

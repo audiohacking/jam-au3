@@ -566,7 +566,12 @@ function App() {
         setLocalModels(state.localModels);
       }
       if (state.remoteModels !== undefined) {
-        setRemoteModels(state.remoteModels);
+        const models = state.remoteModels as string[];
+        if (models.includes('mrt2_small')) {
+          setRemoteModels(['mrt2_small', ...models.filter((m) => m !== 'mrt2_small')]);
+        } else {
+          setRemoteModels(models);
+        }
         setIsFetchingModels(false);
       }
       if (state.remoteModelsError !== undefined) {
@@ -576,7 +581,10 @@ function App() {
         setDownloadProgress(state.downloadProgress);
       }
       if (state.resourcesMissing !== undefined) {
-        setResourcesMissing(state.resourcesMissing);
+        const hasLocalModels = Array.isArray(state.localModels) && state.localModels.length > 0;
+        const modelReady = !!state.modelName && state.modelName !== 'No model loaded';
+        // Native may lag one tick — don't block the UI when models are already on disk.
+        setResourcesMissing(state.resourcesMissing && !hasLocalModels && !modelReady);
       }
       if (state.resourcesProgress !== undefined) {
         setResourcesProgress(state.resourcesProgress);
@@ -1392,7 +1400,7 @@ function App() {
           isFetchingModels={isFetchingModels}
 
           onSelectFolder={() => post({ type: 'selectDownloadFolder' })}
-          onStartDownload={(modelName) => post({ type: 'initResources', modelName })}
+          onStartDownload={(modelName) => post({ type: 'initResources', modelName: modelName || 'mrt2_small' })}
         />
       )}
     </div>
